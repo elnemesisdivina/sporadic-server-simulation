@@ -1,8 +1,9 @@
-"""Self-contained simulation and interactive visualization of the Sporadic Server (SS).
+"""Simulación autónoma y visualización interactiva del Servidor Esporádico (Sporadic Server).
 
-Implements the Sporadic Server algorithm under Rate-Monotonic preemptive
-scheduling according to Sprunt, Sha, and Lehoczky (as presented in Giorgio
-Buttazzo's Hard Real-Time Computing Systems, Section 5.6).
+Implementa el algoritmo del Servidor Esporádico (SS) bajo planificación expulsiva
+(preemptive) por Tasa Monótona (Rate-Monotonic) según Sprunt, Sha y Lehoczky (1989),
+tal como se presenta en el libro de Giorgio Buttazzo: "Hard Real-Time Computing Systems",
+Sección 5.6.
 """
 
 import argparse
@@ -26,14 +27,32 @@ import matplotlib.pyplot as plt
 
 # pylint: enable=g-import-not-at-top
 
+VERSION = "2.1.0"
+
+# Paleta de colores para asignación automática cuando se cargan tareas desde JSON
+_COLOR_PALETTE = [
+    "#0072B2", "#009E73", "#D55E00", "#CC79A7",
+    "#E69F00", "#56B4E9", "#F0E442", "#999999",
+    "#882255", "#44AA99", "#332288", "#DDCC77",
+]
+
 # ==============================================================================
-# Editable Simulation Configuration (7-Task Workload: 6 Periodic + 1 Server)
+# Configuración Editable de Simulación (Carga por defecto: 6 Periódicas + 1 Servidor)
 # ==============================================================================
 
 
 @dataclasses.dataclass
 class PeriodicTask:
-  """Configuration for a hard periodic task."""
+  """Configuración para una tarea periódica de tiempo real estricto (Hard Real-Time).
+
+  Atributos:
+    name: Identificador o nombre de la tarea (ej. r"$\\tau_1$").
+    priority: Prioridad estática asignada (mayor entero = mayor prioridad en RM).
+    compute_time: Tiempo de cómputo en el peor caso (WCET, C_i).
+    deadline: Plazo relativo de ejecución (D_i).
+    period: Período de repetición o llegada entre instancias (T_i).
+    color: Código hexadecimal de color para la visualización en la gráfica.
+  """
 
   name: str
   priority: int
@@ -45,19 +64,34 @@ class PeriodicTask:
 
 @dataclasses.dataclass
 class SporadicServerConfig:
-  """Configuration for a sporadic server task."""
+  """Configuración del Servidor Esporádico (Sporadic Server).
+
+  Atributos:
+    name: Nombre o etiqueta del servidor (ej. r"$S_s$").
+    priority: Prioridad asignada según Rate-Monotonic (en función de su período T_s).
+    budget: Capacidad máxima o presupuesto inicial de cómputo (C_s).
+    period: Período de recarga o reposición de presupuesto (T_s).
+    deadline: Plazo de ejecución asignado al servidor (típicamente D_s = T_s).
+    color: Código hexadecimal de color para representar al servidor.
+  """
 
   name: str
   priority: int
-  budget: float  # Capacity C_s
-  period: float  # Replenishment period T_s
-  deadline: float  # Equal to T_s
+  budget: float  # Capacidad máxima C_s
+  period: float  # Período de recarga T_s
+  deadline: float  # Plazo del servidor D_s
   color: str
 
 
 @dataclasses.dataclass
 class AperiodicJob:
-  """Specification for an aperiodic job arrival."""
+  """Especificación de un trabajo aperiódico individual.
+
+  Atributos:
+    name: Identificador del trabajo (ej. "J1").
+    arrival_time: Instante de tiempo de llegada al sistema (r_i).
+    compute_time: Tiempo de cómputo requerido para finalizar (C_i).
+  """
 
   name: str
   arrival_time: float
@@ -139,18 +173,33 @@ APERIODIC_JOBS = [
 
 
 # ==============================================================================
-# Simulation Data Structures & Helpers
+# Estructuras de Datos de la Simulación y Funciones Auxiliares
 # ==============================================================================
 
 
 def to_ticks(val: float, dt: float) -> int:
-  """Converts continuous time to integer discrete ticks."""
+  """Convierte un valor de tiempo continuo a ticks discretos enteros.
+
+  Args:
+    val: Valor en tiempo continuo (segundos o unidades de tiempo).
+    dt: Paso de discretización de la simulación.
+
+  Returns:
+    Número entero de ticks más cercano mediante redondeo.
+  """
   return int(round(val / dt))
 
 
 @dataclasses.dataclass
 class ExecutionSlice:
-  """A contiguous block of CPU execution."""
+  """Bloque contiguo de ejecución en el procesador (CPU).
+
+  Atributos:
+    start_time: Instante de inicio del bloque de ejecución.
+    end_time: Instante de finalización del bloque de ejecución.
+    runner_name: Nombre de la tarea o servidor en ejecución (o 'Idle' si la CPU está ociosa).
+    job_label: Etiqueta del trabajo aperiódico atendido (si aplica).
+  """
 
   start_time: float
   end_time: float
@@ -160,7 +209,12 @@ class ExecutionSlice:
 
 @dataclasses.dataclass
 class ReplenishmentEvent:
-  """A scheduled capacity replenishment event."""
+  """Evento programado de recarga o reposición de presupuesto.
+
+  Atributos:
+    replenishment_time: Instante de recarga programado (t_R = t_A + T_s).
+    amount: Cantidad de presupuesto C_s a reponer en dicho instante.
+  """
 
   replenishment_time: float
   amount: float
@@ -168,7 +222,14 @@ class ReplenishmentEvent:
 
 @dataclasses.dataclass
 class ActivationEvent:
-  """An active window of the Sporadic Server."""
+  """Ventana activa de consumo del Servidor Esporádico.
+
+  Atributos:
+    activation_time: Instante de inicio de la ventana activa (t_A).
+    closed_time: Instante en que se cierra la ventana de activación.
+    amount_consumed: Cantidad total de presupuesto consumido durante esta ventana.
+    reason: Causa de cierre ('budget_exhausted', 'queue_empty' o 'became_idle').
+  """
 
   activation_time: float
   closed_time: float
@@ -178,7 +239,15 @@ class ActivationEvent:
 
 @dataclasses.dataclass
 class JobRecord:
-  """Execution record for an aperiodic job."""
+  """Registro histórico de métricas y ejecución de un trabajo aperiódico.
+
+  Atributos:
+    job: Especificación original del trabajo (llegada r_i, cómputo C_i).
+    completion_time: Instante de finalización en CPU (f_i).
+    remaining_time: Cómputo pendiente en caso de no haber completado.
+    response_time: Tiempo total de respuesta W_i = f_i - r_i.
+    waiting_time: Tiempo de espera en cola Z_i = W_i - C_i.
+  """
 
   job: AperiodicJob
   completion_time: Optional[float] = None
@@ -189,7 +258,18 @@ class JobRecord:
 
 @dataclasses.dataclass
 class TaskSchedulabilityMetric:
-  """Schedulability analysis result for a task."""
+  """Resultado del análisis de planificabilidad individual para una tarea.
+
+  Atributos:
+    name: Nombre de la tarea periódica o del servidor.
+    priority: Prioridad estática asignada.
+    c_i: Tiempo de cómputo en el peor caso (C_i).
+    t_i: Período de repetición (T_i).
+    d_i: Plazo de ejecución relativo (D_i).
+    u_i: Factor de utilización individual U_i = C_i / T_i.
+    response_time: Tiempo de respuesta en el peor caso calculado por RTA (R_i).
+    schedulable: True si R_i <= D_i (la tarea cumple su plazo); False en caso contrario.
+  """
 
   name: str
   priority: int
@@ -203,7 +283,18 @@ class TaskSchedulabilityMetric:
 
 @dataclasses.dataclass
 class SchedulabilityReport:
-  """Complete real-time schedulability and QoS metrics."""
+  """Informe consolidado de planificabilidad en tiempo real y métricas de QoS.
+
+  Atributos:
+    utilization_periodic: Utilización acumulada de tareas periódicas U_p.
+    utilization_server: Utilización del Servidor Esporádico U_s = C_s / T_s.
+    utilization_total: Utilización total del sistema U_total = U_p + U_s.
+    liu_layland_bound: Cota teórica de utilización de Liu & Layland para n tareas.
+    task_metrics: Lista de métricas individuales de RTA para cada tarea.
+    all_schedulable: True si todas las tareas cumplen R_i <= D_i.
+    avg_aperiodic_response_time: Tiempo promedio de respuesta de trabajos aperiódicos.
+    max_aperiodic_response_time: Tiempo máximo de respuesta de trabajos aperiódicos.
+  """
 
   utilization_periodic: float
   utilization_server: float
@@ -217,7 +308,22 @@ class SchedulabilityReport:
 
 @dataclasses.dataclass
 class SimulationResult:
-  """Complete trace and metadata resulting from simulation."""
+  """Resultado completo de la simulación, trazas temporales y metadatos.
+
+  Atributos:
+    slices: Segmentos contiguos de asignación del CPU.
+    budget_trace_times: Puntos temporales de la traza de presupuesto C_s(t).
+    budget_trace_values: Valores correspondientes de C_s(t) en cada punto.
+    activations: Lista de ventanas activas del Servidor Esporádico registradas.
+    replenishments: Lista de eventos de recarga programados y efectuados.
+    periodic_release_arrows: Tiempos de liberación de instancias periódicas.
+    periodic_deadline_arrows: Tiempos de plazos absolutos de tareas periódicas.
+    aperiodic_arrival_arrows: Tiempos de arribo de peticiones aperiódicas.
+    cpu_totals: Tiempo acumulado de procesador por cada ejecutor.
+    deadline_misses: Lista de violaciones de plazo registradas (tiempo, tarea).
+    job_records: Diccionario de métricas detalladas por cada trabajo aperiódico.
+    schedulability: Informe formal de planificabilidad matemática y RTA.
+  """
 
   slices: list[ExecutionSlice]
   budget_trace_times: list[float]
@@ -235,6 +341,8 @@ class SimulationResult:
 
 @dataclasses.dataclass
 class _PeriodicJobInstance:
+  """Instancia dinámica activa de una tarea periódica en la cola del planificador."""
+
   task: PeriodicTask
   remaining_ticks: int
   deadline_tick: int
@@ -242,12 +350,14 @@ class _PeriodicJobInstance:
 
 @dataclasses.dataclass
 class _AperiodicJobInstance:
+  """Instancia dinámica activa de una petición aperiódica en la cola del servidor."""
+
   job: AperiodicJob
   remaining_ticks: int
 
 
 # ==============================================================================
-# Schedulability & RTA Analysis (Point 5)
+# Análisis Formal de Planificabilidad y RTA (Teorema 5.1 de Buttazzo)
 # ==============================================================================
 
 
@@ -256,12 +366,27 @@ def compute_schedulability(
     server_config: SporadicServerConfig,
     job_records: Optional[dict[str, JobRecord]] = None,
 ) -> SchedulabilityReport:
-  """Computes Rate-Monotonic utilization and exact Response-Time Analysis (RTA).
+  """Calcula la utilización bajo Rate-Monotonic y el Análisis de Tiempo de Respuesta (RTA).
 
-  By Buttazzo Theorem 5.1, the Sporadic Server (C_s, T_s) imposes identical
-  worst-case interference as a hard periodic task with the same parameters.
+  Fundamento Teórico:
+    Por el Teorema 5.1 de Giorgio Buttazzo ("Hard Real-Time Computing Systems"),
+    un Servidor Esporádico caracterizado por (C_s, T_s) produce exactamente la misma
+    interferencia en el peor caso sobre las tareas de menor prioridad que una tarea
+    periódica estricta equivalente con tiempo de cómputo C = C_s y período T = T_s.
+    Por lo tanto, la planificabilidad del conjunto completo se valida unificando el
+    servidor como una tarea periódica más y aplicando la ecuación de punto fijo de RTA.
+
+  Args:
+    periodic_tasks: Lista de tareas periódicas del sistema.
+    server_config: Configuración del Servidor Esporádico (C_s, T_s, prioridad).
+    job_records: Diccionario opcional de registros de trabajos para calcular métricas de QoS.
+
+  Returns:
+    Objeto SchedulabilityReport con utilizaciones, cota de Liu & Layland, tiempos
+    de respuesta individuales y estado de planificabilidad.
   """
-  # Unified task representation for RTA: (name, priority, C, T, D)
+  # ── PASO 1: UNIFICAR TAREAS PERIÓDICAS Y SERVIDOR ─────────────────────────
+  # Tratamos al servidor como una tarea periódica equivalente (Teorema 5.1 Buttazzo).
   unified = [
       (p.name, p.priority, p.compute_time, p.period, p.deadline)
       for p in periodic_tasks
@@ -273,10 +398,16 @@ def compute_schedulability(
       server_config.deadline,
   )]
 
-  # Sort descending by priority
+  # ── PASO 2: ORDENAR POR PRIORIDAD DECRECIENTE ──────────────────────────────
+  # Las tareas de mayor prioridad interfieren sobre las de menor prioridad.
   unified.sort(key=lambda t: t[1], reverse=True)
   n_tasks = len(unified)
 
+  # ── PASO 3: CALCULAR FACTORES DE UTILIZACIÓN ──────────────────────────────
+  # Utilización: U = Σ (C_i / T_i).
+  # Cota suficiente de Liu & Layland (1973): U_LL = n * (2^(1/n) - 1).
+  # Si U_total > 1.0 => El sistema es INVIABLE (sobrecarga del procesador).
+  # Si U_LL < U_total <= 1.0 => La prueba de Liu & Layland no concluye; RTA es condición exacta.
   u_p = sum(p.compute_time / p.period for p in periodic_tasks)
   u_s = server_config.budget / server_config.period
   u_total = u_p + u_s
@@ -285,22 +416,26 @@ def compute_schedulability(
   metrics: list[TaskSchedulabilityMetric] = []
   all_sched = True
 
+  # ── PASO 4: ANÁLISIS DE TIEMPO DE RESPUESTA (RTA) POR ITERACIÓN DE PUNTO FIJO
+  # Para cada tarea τ_i, resolvemos la recurrencia:
+  #   R_i^(k+1) = C_i + Σ_{j ∈ hp(i)} ⌈ R_i^(k) / T_j ⌉ * C_j
+  # donde hp(i) representa el conjunto de tareas de mayor prioridad que τ_i.
+  # La iteración se detiene cuando R_i^(k+1) == R_i^(k) o cuando R_i > D_i.
   for idx, (name, prio, c_i, t_i, d_i) in enumerate(unified):
     u_i = c_i / t_i
-    # Higher priority tasks are those before index idx
-    hp_tasks = unified[:idx]
+    hp_tasks = unified[:idx]  # Conjunto de tareas de mayor prioridad
 
-    # Fixed-point iteration for R_i: R^(k+1) = C_i + sum_{j in hp} ceil(R^(k) / T_j) * C_j
-    r_k = c_i
+    r_k = c_i  # Condición inicial: cómputo propio sin interferencia
     converged = False
     for _ in range(100):
+      # Suma de interferencia de todas las tareas de mayor prioridad
       r_next = c_i + sum(math.ceil(r_k / t_j) * c_j for _, _, c_j, t_j, _ in hp_tasks)
       if r_next == r_k:
         converged = True
         break
       if r_next > d_i:
         r_k = r_next
-        break
+        break  # Superó el plazo: la tarea no es planificable
       r_k = r_next
 
     sched = converged and (r_k <= d_i)
@@ -320,7 +455,9 @@ def compute_schedulability(
         )
     )
 
-  # Aperiodic QoS metrics
+  # ── PASO 5: MÉTRICAS DE CALIDAD DE SERVICIO (QoS) APERIÓDICO ───────────────
+  # Tiempo de respuesta = f_i - r_i (finalización - llegada).
+  # Tiempo de espera en cola = (f_i - r_i) - C_i.
   completed_resp_times = []
   if job_records:
     for rec in job_records.values():
@@ -350,8 +487,26 @@ def compute_schedulability(
 
 
 # ==============================================================================
-# Simulation Logic (Supports Points 3, 4, 5)
+# Lógica de Planificación y Simulación Temporal
 # ==============================================================================
+
+
+def is_server_ready(queue_len: int, budget_ticks: int) -> bool:
+  """Determina si el Servidor Esporádico está listo (condición 'Ready') para ejecutarse.
+
+  Condición formal del algoritmo (Sprunt-Sha-Lehoczky / Buttazzo §5.6):
+    El servidor puede competir por el procesador si y solo si:
+      1. Su cola de peticiones aperiódicas no está vacía (queue_len > 0).
+      2. Su presupuesto disponible C_s(t) es estrictamente positivo (budget_ticks > 0).
+
+  Args:
+    queue_len: Cantidad de tareas aperiódicas actualmente en la cola FIFO.
+    budget_ticks: Presupuesto actual de capacidad C_s(t) expresado en ticks discretos.
+
+  Returns:
+    True si y solo si ambas condiciones se cumplen; False en caso contrario.
+  """
+  return queue_len > 0 and budget_ticks > 0
 
 
 def run_simulation(
@@ -362,19 +517,19 @@ def run_simulation(
     aperiodic_jobs: Optional[list[AperiodicJob]] = None,
     mode: str = "queue_aware",
 ) -> SimulationResult:
-  """Executes the discrete-time Sporadic Server simulation.
+  """Ejecuta la simulación a tiempo discreto del Servidor Esporádico (Sporadic Server).
 
   Args:
-    horizon: Total duration of the simulation in time units.
-    dt: Discretization step (delta t).
-    periodic_tasks: List of hard periodic tasks.
-    server_config: Sporadic Server configuration parameters.
-    aperiodic_jobs: List of aperiodic jobs to be served.
-    mode: 'queue_aware' (POSIX.1d: t_A set when server executes a job) or
-      'buttazzo_pure' (SSL89: t_A set whenever P_exe >= P_s and C_s > 0).
+    horizon: Duración total de la simulación en unidades de tiempo continuo.
+    dt: Paso de discretización temporal (delta t).
+    periodic_tasks: Lista de tareas periódicas de tiempo real estricto (Hard Real-Time).
+    server_config: Configuración y parámetros del Servidor Esporádico (C_s, T_s, prioridad).
+    aperiodic_jobs: Lista de trabajos aperiódicos con instantes de llegada y cómputo.
+    mode: 'queue_aware' (estándar POSIX.1d: t_A se fija cuando el servidor ejecuta un trabajo) o
+      'buttazzo_pure' (SSL89 original: t_A se fija siempre que P_exe >= P_s y C_s > 0).
 
   Returns:
-    SimulationResult containing execution slices, budget traces, and metrics.
+    SimulationResult con rebanadas de ejecución, trazas de presupuesto y métricas.
   """
   if periodic_tasks is None:
     periodic_tasks = PERIODIC_TASKS
@@ -399,7 +554,7 @@ def run_simulation(
 
   activations: list[ActivationEvent] = []
   replenishments: list[ReplenishmentEvent] = []
-  raw_slices: list[tuple[str, str]] = []  # (runner_name, job_label) per tick
+  raw_slices: list[tuple[str, str]] = []  # (ejecutor_en_cpu, etiqueta_trabajo) por tick
   budget_times: list[float] = [0.0]
   budget_values: list[float] = [server_config.budget]
 
@@ -412,10 +567,19 @@ def run_simulation(
       for j in aperiodic_jobs
   }
 
+  # ─────────────────────────────────────────────────────────────────────────────
+  # BUCLE PRINCIPAL DE SIMULACIÓN (tick a tick, paso de tiempo dt)
+  # Cada iteración k representa el intervalo [k·dt, (k+1)·dt).
+  # ─────────────────────────────────────────────────────────────────────────────
   for k in range(total_ticks):
-    current_time = k * dt
+    current_time = k * dt  # Tiempo continuo correspondiente al tick actual
 
-    # 1. Apply any replenishments arriving at tick k
+    # ── PASO 1: APLICAR RECARGAS PROGRAMADAS DE PRESUPUESTO ───────────────────
+    # El Servidor Esporádico programa una recarga de presupuesto en t_R = t_A + T_s.
+    # Cuando llegamos al tick de recarga, restauramos el presupuesto C_s hasta el
+    # máximo permitido (no puede exceder el presupuesto inicial C_s_max).
+    # REGLA BUTTAZZO §5.6: la recarga es igual a la cantidad consumida, no siempre
+    # el presupuesto completo.
     if k in pending_replenishments:
       amt = pending_replenishments[k]
       budget_times.append(current_time)
@@ -424,16 +588,24 @@ def run_simulation(
       budget_times.append(current_time)
       budget_values.append(budget_ticks * dt)
 
-    # 2. Check periodic deadlines and release periodic tasks
+    # ── PASO 2: VERIFICAR DEADLINES Y LIBERAR NUEVAS INSTANCIAS PERIÓDICAS ────
+    # 2a) Verificar si alguna instancia activa ha superado su deadline absoluto.
+    #     Bajo RM, si una tarea aún tiene cómputo pendiente al llegar a d_i = k·dt,
+    #     se registra como un "deadline miss" (violación de plazo).
     for inst in periodic_instances:
       if inst.remaining_ticks > 0 and k >= inst.deadline_tick:
         deadline_misses.append((current_time, inst.task.name))
 
+    # 2b) Liberar nuevas instancias periódicas según su período.
+    #     Bajo Rate-Monotonic, las tareas se ordenan por prioridad inversamente
+    #     proporcional al período: periodo más corto → prioridad más alta.
+    #     En t = 0, k·T_i == 0 para toda τ_i, por lo que todas se liberan a la vez.
     for ptask in periodic_tasks:
       p_period_ticks = to_ticks(ptask.period, dt)
-      if k % p_period_ticks == 0:
+      if k % p_period_ticks == 0:  # ¿Es k un múltiplo del período de la tarea?
         c_ticks = to_ticks(ptask.compute_time, dt)
         d_ticks = to_ticks(ptask.deadline, dt)
+        # Crear instancia con cómputo restante = C_i y deadline absoluto = k + D_i
         periodic_instances.append(
             _PeriodicJobInstance(
                 task=ptask,
@@ -444,7 +616,11 @@ def run_simulation(
         periodic_releases.append((current_time, ptask.name))
         periodic_deadlines.append(((k + d_ticks) * dt, ptask.name))
 
-    # 3. Enqueue arriving aperiodic jobs
+    # ── PASO 3: ENCOLAR TRABAJOS APERIÓDICOS QUE LLEGAN EN ESTE TICK ──────────
+    # Los trabajos aperiódicos llegan en tiempos arbitrarios (no periódicos).
+    # Los encolamos en la cola FIFO del Servidor Esporádico cuando su tiempo de
+    # llegada r_i coincide con el tick actual k.
+    # El servidor los atenderá uno por uno en orden de llegada (FIFO).
     for ajob in aperiodic_jobs:
       if to_ticks(ajob.arrival_time, dt) == k:
         aperiodic_queue.append(
@@ -455,7 +631,13 @@ def run_simulation(
         )
         aperiodic_arrivals.append((current_time, ajob.name))
 
-    # 4. Pick highest-priority ready task
+    # ── PASO 4: REEVALUACIÓN DE ESTADO Y DESPACHO POR PRIORIDAD (DISPATCHER RM) ──
+    # Se evalúa en cada tick si el Servidor Esporádico está listo (condición isReady).
+    # Reevaluación inmediata: si una tarea previa terminó o el procesador queda libre,
+    # el planificador evalúa de inmediato a todos los candidatos listos.
+    server_ready = is_server_ready(len(aperiodic_queue), budget_ticks)
+
+    # Identificar todas las tareas periódicas que tienen cómputo pendiente (ready)
     ready_periodics = [p for p in periodic_instances if p.remaining_ticks > 0]
     best_periodic = (
         max(ready_periodics, key=lambda p: p.task.priority)
@@ -463,9 +645,11 @@ def run_simulation(
         else None
     )
 
-    server_ready = (len(aperiodic_queue) > 0) and (budget_ticks > 0)
-
-    # In buttazzo_pure mode: SS is active if P_exe >= P_s and C_s > 0
+    # ── MODO BUTTAZZO PURO (SSL89): activar ventana cuando P_exe >= P_s ────────
+    # En el modo original de Sprunt-Sha-Lehoczky (1989), la ventana de activación
+    # t_A se abre cuando el ejecutor en CPU tiene prioridad >= P_s, aunque el
+    # servidor no esté ejecutando trabajos aperiódicos. El modo por defecto
+    # (queue_aware) solo abre t_A cuando el servidor realmente ejecuta un trabajo.
     if mode == "buttazzo_pure" and not is_active and budget_ticks > 0:
       if (
           best_periodic
@@ -475,57 +659,83 @@ def run_simulation(
         t_a_tick = k
         consumed_ticks = 0
 
-    chosen_runner = "Idle"
-    chosen_label = ""
+    # ── PASO 5: EJECUTAR LA TAREA SELECCIONADA (un tick de tiempo dt) ─────────
+    # Comparación matemática de prioridades bajo Rate-Monotonic:
+    # El Servidor Esporádico participa como un competidor más con prioridad server_config.priority.
+    # Se evalúan los tres casos mutuamente excluyentes:
+    chosen_runner = "Idle"  # Por defecto: CPU ociosa si nadie está listo
+    chosen_label = ""       # Etiqueta del trabajo aperiódico (si aplica)
 
     if best_periodic and (
         not server_ready or best_periodic.task.priority > server_config.priority
     ):
+      # ── CASO A: Despacho de Tarea Periódica de Mayor Prioridad ─────────────
+      # La tarea periódica toma el control del procesador (preempción RM).
+      # Si el servidor estaba listo (server_ready=True), queda en estado DESALOJADO
+      # (preempted) sin consumir su presupuesto durante este tick.
       chosen_runner = best_periodic.task.name
-      best_periodic.remaining_ticks -= 1
+      best_periodic.remaining_ticks -= 1  # Consume 1 tick de cómputo
+
     elif server_ready:
+      # ── CASO B: Despacho del Servidor Esporádico (Transición a EJECUTANDO) ──
+      # El procesador está libre de tareas periódicas de mayor prioridad y el
+      # servidor cumple la condición is_server_ready (cola no vacía y presupuesto > 0).
+      # Su estado transiciona inmediatamente de DESALOJADO u OCIOSO a EJECUTANDO.
       chosen_runner = server_config.name
+
+      # Si el servidor no tenía ventana activa abierta, se registra el instante t_A
       if not is_active:
         is_active = True
-        t_a_tick = k
-        consumed_ticks = 0
+        t_a_tick = k       # Guardar tick de inicio de la ventana activa (t_A)
+        consumed_ticks = 0  # Reiniciar contador de ticks consumidos en esta ventana
 
+      # Extraer y ejecutar el trabajo al frente de la cola aperiódica (FIFO)
       front_job = aperiodic_queue[0]
       chosen_label = front_job.job.name
-      front_job.remaining_ticks -= 1
-      budget_ticks -= 1
-      consumed_ticks += 1
+      front_job.remaining_ticks -= 1   # Reducir cómputo pendiente del trabajo
+      budget_ticks -= 1                # Reducir presupuesto del servidor en 1 tick
+      consumed_ticks += 1              # Contabilizar ticks consumidos en esta ventana
 
+      # ¿El trabajo aperiódico completó su tiempo de cómputo C_i?
       if front_job.remaining_ticks == 0:
-        aperiodic_queue.popleft()
+        aperiodic_queue.popleft()  # Sacarlo de la cola FIFO
+        # Registrar tiempo de finalización: al final del tick actual = (k+1)·dt
         job_records[front_job.job.name].completion_time = (k + 1) * dt
         job_records[front_job.job.name].remaining_time = 0.0
 
-      # Close active window if budget exhausted or queue emptied
+      # ── PASO 6: CERRAR VENTANA ACTIVA Y PROGRAMAR RECARGA (REPLENISHMENT) ──
+      # La ventana activa se cierra cuando:
+      #   (a) el presupuesto C_s se agota (budget_ticks == 0), o
+      #   (b) la cola aperiódica queda vacía (todos los trabajos terminaron)
+      # Al cerrar la ventana, se programa la recarga en t_R = t_A + T_s.
+      # La recarga es EXACTAMENTE la cantidad consumida en esta ventana (no
+      # necesariamente C_s completo), siguiendo la regla de Buttazzo §5.6.
       if budget_ticks == 0 or len(aperiodic_queue) == 0:
-        r_tick = t_a_tick + server_period_ticks
-        pending_replenishments[r_tick] += consumed_ticks
+        r_tick = t_a_tick + server_period_ticks  # t_R = t_A + T_s (en ticks)
+        pending_replenishments[r_tick] += consumed_ticks  # Programar recarga
         replenishments.append(
             ReplenishmentEvent(
-                replenishment_time=r_tick * dt,
-                amount=consumed_ticks * dt,
+                replenishment_time=r_tick * dt,    # t_R en tiempo continuo
+                amount=consumed_ticks * dt,         # Cantidad a recargar = consumido
             )
         )
         activations.append(
             ActivationEvent(
-                activation_time=t_a_tick * dt,
-                closed_time=(k + 1) * dt,
-                amount_consumed=consumed_ticks * dt,
+                activation_time=t_a_tick * dt,       # t_A: inicio de la ventana
+                closed_time=(k + 1) * dt,            # t_cierre: fin de la ventana
+                amount_consumed=consumed_ticks * dt,  # Total consumido
                 reason="budget_exhausted"
                 if budget_ticks == 0
                 else "queue_empty",
             )
         )
+        # Desactivar ventana hasta la llegada del siguiente trabajo aperiódico
         is_active = False
         t_a_tick = None
         consumed_ticks = 0
+
     elif mode == "buttazzo_pure" and is_active:
-      # In pure mode, if idle or lower priority task runs, SS becomes idle
+      # En modo puro Buttazzo, si corre una tarea de menor prioridad o la CPU queda idle, el SS pasa a ocioso
       if not best_periodic or best_periodic.task.priority < server_config.priority:
         if consumed_ticks > 0:
           r_tick = t_a_tick + server_period_ticks
@@ -618,7 +828,7 @@ def run_simulation(
 
 
 # ==============================================================================
-# Interactive Visualization (Matplotlib Hover + HTML5 Export)
+# Visualización Interactiva (Matplotlib con Hover + Exportación HTML5)
 # ==============================================================================
 
 
@@ -631,16 +841,16 @@ def plot_simulation(
     server_config: Optional[SporadicServerConfig] = None,
     interactive_html: Optional[str] = None,
 ) -> None:
-  """Renders the Buttazzo-style Gantt chart with interactive hover inspection.
+  """Genera el diagrama de Gantt estilo Buttazzo con inspección interactiva por hover.
 
   Args:
-    result: SimulationResult data.
-    output_path: Path to save the PNG image.
-    show: Whether to display the interactive GUI window.
-    horizon: Simulation horizon.
-    periodic_tasks: Periodic tasks configuration.
-    server_config: Sporadic Server configuration.
-    interactive_html: Optional path to export an interactive HTML dashboard.
+    result: Objeto SimulationResult con las trazas y métricas de la simulación.
+    output_path: Ruta de archivo donde se guardará la figura PNG en alta resolución.
+    show: Si True y existe interfaz gráfica disponible, despliega la ventana interactiva.
+    horizon: Horizonte temporal total a graficar.
+    periodic_tasks: Configuración de tareas periódicas.
+    server_config: Configuración del Servidor Esporádico.
+    interactive_html: Ruta opcional para exportar el dashboard HTML interactivo.
   """
   if not show or not os.environ.get("DISPLAY"):
     plt.switch_backend("Agg")
@@ -650,14 +860,14 @@ def plot_simulation(
   if server_config is None:
     server_config = SERVER_CONFIG
 
-  # Track ordering: Periodic tasks at top, Sporadic Server at bottom (y=0)
+  # Orden de pistas: Tareas periódicas arriba por prioridad decreciente, Servidor abajo
   ordered_tracks = sorted(
       periodic_tasks, key=lambda t: t.priority, reverse=True
   ) + [server_config]
   track_names = [t.name for t in ordered_tracks]
   track_colors = {t.name: t.color for t in ordered_tracks}
 
-  # Vertical track spacing: S_s at bottom (y = 0.0), tau_1 at top
+  # Separación vertical de pistas: S_s en la parte inferior (y = 0.0)
   track_spacing = 1.35
   y_coords = {
       name: idx * track_spacing
@@ -672,7 +882,7 @@ def plot_simulation(
       gridspec_kw={"height_ratios": [3.2, 1.1], "hspace": 0.12},
   )
 
-  # --- Top Subplot: Gantt Chart ---
+  # --- Subgráfico Superior: Diagrama de Gantt de Ejecución ---
   bar_height = 0.55
   slice_artist_map: list[tuple[Any, ExecutionSlice]] = []
 
@@ -701,7 +911,7 @@ def plot_simulation(
             fontsize=9,
         )
 
-  # Index release and deadline times by task to offset coinciding arrows
+  # Mapear liberaciones y plazos para desplazar flechas coincidentes
   release_times_by_task = collections.defaultdict(set)
   for t_rel, name in result.periodic_release_arrows:
     release_times_by_task[name].add(round(t_rel, 4))
@@ -710,7 +920,7 @@ def plot_simulation(
   for t_dl, name in result.periodic_deadline_arrows:
     deadline_times_by_task[name].add(round(t_dl, 4))
 
-  # Release and deadline arrows
+  # Flechas de liberación y plazos (deadlines)
   for t_rel, name in result.periodic_release_arrows:
     if name in y_coords and t_rel <= horizon:
       y = y_coords[name]
@@ -763,7 +973,7 @@ def plot_simulation(
           ),
       )
 
-  # Vertical dotted lines connecting t_A and closed_time (Buttazzo Ch 5)
+  # Líneas verticales punteadas para ventanas de activación t_A (Buttazzo Cap. 5)
   for act in result.activations:
     if act.activation_time <= horizon:
       ax_gantt.plot(
@@ -798,7 +1008,7 @@ def plot_simulation(
           alpha=0.8,
       )
 
-  # Vertical markers and slanted pointers for replenishments (t_R)
+  # Marcadores de recarga programada t_R
   for repl in result.replenishments:
     if repl.replenishment_time <= horizon:
       ax_gantt.plot(
@@ -835,7 +1045,7 @@ def plot_simulation(
             va="bottom",
         )
 
-  # Gantt legend with proxy handles
+  # Leyenda descriptiva del diagrama de Gantt
   legend_handles = [
       mpatches.Patch(
           facecolor=track_colors[name],
@@ -851,7 +1061,7 @@ def plot_simulation(
           marker=r"$\uparrow$",
           markersize=9,
           linestyle="None",
-          label="Periodic Release",
+          label="Liberación Periódica",
       ),
       mlines.Line2D(
           [],
@@ -860,7 +1070,7 @@ def plot_simulation(
           marker=r"$\downarrow$",
           markersize=9,
           linestyle="None",
-          label="Periodic Deadline",
+          label="Plazo (Deadline)",
       ),
       mlines.Line2D(
           [],
@@ -869,16 +1079,16 @@ def plot_simulation(
           marker=r"$\uparrow$",
           markersize=9,
           linestyle="None",
-          label="Aperiodic Arrival",
+          label="Llegada Aperiódica",
       ),
   ]
 
   ax_gantt.set_yticks([y_coords[n] for n in track_names])
   ax_gantt.set_yticklabels(track_names, fontsize=11, fontweight="bold")
   ax_gantt.set_ylim(-1.05, (len(track_names) - 1) * track_spacing + 0.85)
-  ax_gantt.set_ylabel("Tasks", fontsize=11, fontweight="bold")
+  ax_gantt.set_ylabel("Tareas", fontsize=11, fontweight="bold")
   ax_gantt.set_title(
-      "Sporadic Server (SS) Scheduling Simulation under RM",
+      "Simulación del Servidor Esporádico (SS) bajo Rate-Monotonic",
       fontsize=14,
       fontweight="bold",
       pad=44,
@@ -895,14 +1105,14 @@ def plot_simulation(
   ax_gantt.set_xticks(list(range(0, int(horizon) + 1, 1)), minor=True)
   ax_gantt.grid(True, which="both", axis="x", linestyle=":", alpha=0.5)
 
-  # --- Bottom Subplot: Server Capacity C_s(t) ---
+  # --- Subgráfico Inferior: Curva de Presupuesto C_s(t) ---
   ax_budget.step(
       result.budget_trace_times,
       result.budget_trace_values,
       where="post",
       color="#16a085",
       linewidth=1.8,
-      label=r"Capacity $C_s(t)$",
+      label=r"Presupuesto $C_s(t)$",
   )
   ax_budget.fill_between(
       result.budget_trace_times,
@@ -917,13 +1127,13 @@ def plot_simulation(
   ax_budget.set_yticks([float(i) for i in range(int(server_config.budget) + 1)])
   ax_budget.set_xticks(list(range(0, int(horizon) + 1, 2)))
   ax_budget.set_xticks(list(range(0, int(horizon) + 1, 1)), minor=True)
-  ax_budget.set_xlabel("Time (t)", fontsize=11, fontweight="bold")
-  ax_budget.set_ylabel(r"Budget $C_s$", fontsize=11, fontweight="bold")
+  ax_budget.set_xlabel("Tiempo (t)", fontsize=11, fontweight="bold")
+  ax_budget.set_ylabel(r"Presupuesto $C_s$", fontsize=11, fontweight="bold")
   ax_budget.grid(True, which="both", axis="x", linestyle=":", alpha=0.5)
   ax_budget.legend(loc="upper right", framealpha=0.9)
   plt.subplots_adjust(top=0.88, bottom=0.08, left=0.07, right=0.97)
 
-  # Interactive Tooltip Hook for Matplotlib GUI (Interactive Mode)
+  # Gancho de tooltip interactivo para la GUI de Matplotlib
   hover_annotation = ax_gantt.annotate(
       "",
       xy=(0, 0),
@@ -947,10 +1157,10 @@ def plot_simulation(
               sl.start_time <= x <= sl.end_time
               and (sl_y - bar_height / 2) <= y <= (sl_y + bar_height / 2)
           ):
-            job_info = f" | Job: {sl.job_label}" if sl.job_label else ""
+            job_info = f" | Trabajo: {sl.job_label}" if sl.job_label else ""
             hover_annotation.xy = (x, y)
             hover_annotation.set_text(
-                f"{sl.runner_name}{job_info}\nInterval: [{sl.start_time:.1f}, {sl.end_time:.1f}]\nDuration: {sl.end_time - sl.start_time:.1f} units"
+                f"{sl.runner_name}{job_info}\nIntervalo: [{sl.start_time:.1f}, {sl.end_time:.1f}]\nDuración: {sl.end_time - sl.start_time:.1f} u"
             )
             hover_annotation.set_visible(True)
             fig.canvas.draw_idle()
@@ -962,9 +1172,9 @@ def plot_simulation(
   fig.canvas.mpl_connect("motion_notify_event", on_hover)
 
   plt.savefig(output_path, dpi=300, bbox_inches="tight")
-  print(f"[+] Simulation figure successfully saved to: {output_path}")
+  print(f"[+] Figura de simulación guardada exitosamente en: {output_path}")
 
-  # Export interactive HTML dashboard if requested or by default
+  # Exportar dashboard interactivo HTML si se solicita
   if interactive_html:
     export_interactive_html(
         result,
@@ -980,7 +1190,7 @@ def plot_simulation(
 
 
 # ==============================================================================
-# Standalone Interactive HTML5 Dashboard Generator
+# Generador del Dashboard HTML5 / SVG Interactivo y Animado
 # ==============================================================================
 
 
@@ -991,7 +1201,7 @@ def export_interactive_html(
     periodic_tasks: Optional[list[PeriodicTask]] = None,
     server_config: Optional[SporadicServerConfig] = None,
 ) -> None:
-  """Generates a zero-dependency, rich interactive HTML5/SVG simulation dashboard."""
+  """Genera un dashboard interactivo en HTML5/SVG totalmente autónomo (cero dependencias)."""
   if periodic_tasks is None:
     periodic_tasks = PERIODIC_TASKS
   if server_config is None:
@@ -1003,6 +1213,11 @@ def export_interactive_html(
   track_names = [t.name.replace("$", "").replace("\\", "") for t in ordered_tracks]
   track_colors = {
       t.name.replace("$", "").replace("\\", ""): t.color for t in ordered_tracks
+  }
+  server_clean_name = server_config.name.replace("$", "").replace("\\", "")
+  task_priorities = {
+      t.name.replace("$", "").replace("\\", ""): t.priority
+      for t in ordered_tracks
   }
 
   slices_data = [
@@ -1437,6 +1652,10 @@ def export_interactive_html(
     const jobs = {json.dumps(aperiodic_jobs_data)};
     const tracks = {json.dumps(track_names)};
     const horizon = {horizon};
+    const serverName = {json.dumps(server_clean_name)};
+    const serverBudgetMax = {server_config.budget};
+    const serverPriority = {server_config.priority};
+    const taskPriorities = {json.dumps(task_priorities)};
 
     const svg = document.getElementById("ganttSvg");
     const tooltip = document.getElementById("tooltip");
@@ -1528,7 +1747,7 @@ def export_interactive_html(
     let lastTimestamp = null;
 
     function getBudgetAt(t) {{
-      let currentB = 2.0;
+      let currentB = serverBudgetMax;
       for (let i = 0; i < budgetTrace.length; i++) {{
         if (budgetTrace[i].time <= t + 0.001) {{
           currentB = budgetTrace[i].budget;
@@ -1615,7 +1834,7 @@ def export_interactive_html(
       arrivals.forEach((arr) => {{
         if (arr.time <= t) {{
           const x = xScale(arr.time);
-          const ssIdx = tracks.indexOf("S_s");
+          const ssIdx = tracks.indexOf(serverName);
           if (ssIdx !== -1) {{
             const y = margin.top + ssIdx * trackHeight + trackHeight;
             const arrow = document.createElementNS("http://www.w3.org/2000/svg", "line");
@@ -1644,9 +1863,10 @@ def export_interactive_html(
       replenishments.forEach((repl) => {{
         if (repl.t_R <= t) {{
           const x = xScale(repl.t_R);
+          const ssIdx = tracks.indexOf(serverName);
           const rLine = document.createElementNS("http://www.w3.org/2000/svg", "line");
           rLine.setAttribute("x1", x);
-          rLine.setAttribute("y1", margin.top + (tracks.indexOf("S_s") * trackHeight));
+          rLine.setAttribute("y1", margin.top + (ssIdx !== -1 ? ssIdx * trackHeight : 0));
           rLine.setAttribute("x2", x);
           rLine.setAttribute("y2", budgetY + budgetHeight);
           rLine.setAttribute("stroke", "#10b981");
@@ -1660,7 +1880,7 @@ def export_interactive_html(
       let pathD = "";
       let pts = budgetTrace.filter(pt => pt.time <= t + 0.001);
       if (pts.length === 0) {{
-        pts = [{{ time: 0, budget: 2.0 }}];
+        pts = [{{ time: 0, budget: serverBudgetMax }}];
       }}
       // Punto actual proyectado a t
       const currentB = getBudgetAt(t);
@@ -1668,7 +1888,7 @@ def export_interactive_html(
 
       pts.forEach((pt, i) => {{
         const x = xScale(pt.time);
-        const y = budgetY + budgetHeight - (pt.budget / 2.0) * budgetHeight;
+        const y = budgetY + budgetHeight - (pt.budget / serverBudgetMax) * budgetHeight;
         if (i === 0) pathD += `M ${{x}} ${{y}}`;
         else pathD += ` L ${{x}} ${{y}}`;
       }});
@@ -1722,20 +1942,31 @@ def export_interactive_html(
         hudQueue.textContent = "Vacía";
       }}
 
-      // Estado del servidor
-      if (activeRunner === "S_s") {{
+      // Estado dinámico del Servidor Esporádico
+      const isServerExecuting = (activeRunner === serverName || activeRunner === "S_s");
+
+      if (isServerExecuting) {{
         hudServerStatus.innerHTML = `<span class="badge badge-running">EJECUTANDO (-1/s)</span>`;
       }} else if (currentB <= 0.001) {{
         hudServerStatus.innerHTML = `<span class="badge badge-suspended">SUSPENDIDO (C_s=0)</span>`;
-      }} else if (activeQueue.length > 0) {{
-        hudServerStatus.innerHTML = `<span class="badge badge-waiting">DESALOJADO</span>`;
-      }} else {{
+      }} else if (activeQueue.length === 0) {{
         hudServerStatus.innerHTML = `<span class="badge badge-ok">OCIOSO (Listo)</span>`;
+      }} else {{
+        // Hay peticiones en cola (activeQueue.length > 0) y presupuesto disponible (currentB > 0)
+        const runnerPrio = taskPriorities[activeRunner] || 0;
+        if (activeRunner !== "Idle" && runnerPrio > serverPriority) {{
+          hudServerStatus.innerHTML = `<span class="badge badge-waiting">DESALOJADO (por ${{activeRunner}})</span>`;
+        }} else if (activeRunner === "Idle") {{
+          // Si el procesador está ocioso, el servidor listo no está siendo desalojado
+          hudServerStatus.innerHTML = `<span class="badge badge-ok">OCIOSO (Listo)</span>`;
+        }} else {{
+          hudServerStatus.innerHTML = `<span class="badge badge-waiting">LISTO EN ESPERA</span>`;
+        }}
       }}
 
       // Presupuesto
-      hudBudget.textContent = `${{currentB.toFixed(2)}} / 2.0 u`;
-      budgetFill.style.width = `${{(currentB / 2.0) * 100}}%`;
+      hudBudget.textContent = `${{currentB.toFixed(2)}} / ${{serverBudgetMax.toFixed(1)}} u`;
+      budgetFill.style.width = `${{Math.min(100, Math.max(0, (currentB / serverBudgetMax) * 100))}}%`;
 
       // Próxima recarga
       const nextR = replenishments.find(r => r.t_R > t + 0.001);
@@ -1838,21 +2069,26 @@ def export_interactive_html(
 
 
 # ==============================================================================
-# CSV and JSON Exporters (Point 4)
+# Exportadores a Formatos CSV y JSON
 # ==============================================================================
 
 
 def export_trace_to_csv(result: SimulationResult, output_path: str) -> None:
-  """Exports the simulation execution timeline slices to a CSV file."""
+  """Exporta los intervalos de ejecución en procesador (CPU) a un archivo CSV.
+
+  Args:
+    result: Objeto SimulationResult obtenido tras la simulación.
+    output_path: Ruta de destino del archivo CSV.
+  """
   with open(output_path, "w", newline="", encoding="utf-8") as f:
     writer = csv.writer(f)
     writer.writerow([
-        "slice_index",
-        "start_time",
-        "end_time",
-        "duration",
-        "runner",
-        "job_label",
+        "indice_rebanada",
+        "tiempo_inicio",
+        "tiempo_fin",
+        "duracion",
+        "ejecutor",
+        "etiqueta_trabajo",
     ])
     for idx, sl in enumerate(result.slices, 1):
       writer.writerow([
@@ -1863,11 +2099,16 @@ def export_trace_to_csv(result: SimulationResult, output_path: str) -> None:
           sl.runner_name.replace("$", "").replace("\\", ""),
           sl.job_label,
       ])
-  print(f"[+] Execution trace exported to CSV: {output_path}")
+  print(f"[+] Traza de ejecución exportada a CSV: {output_path}")
 
 
 def export_trace_to_json(result: SimulationResult, output_path: str) -> None:
-  """Exports complete simulation metadata and traces to a JSON file."""
+  """Exporta todos los metadatos y trazas completas de la simulación a formato JSON.
+
+  Args:
+    result: Objeto SimulationResult con toda la información generada.
+    output_path: Ruta de destino del archivo JSON.
+  """
   data = {
       "slices": [
           {
@@ -1905,162 +2146,322 @@ def export_trace_to_json(result: SimulationResult, output_path: str) -> None:
   }
   with open(output_path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)
-  print(f"[+] Complete simulation data exported to JSON: {output_path}")
+  print(f"[+] Traza y metadatos exportados a JSON: {output_path}")
 
 
 # ==============================================================================
-# Console Reporting
+# Reportes y Resumen en Consola
 # ==============================================================================
 
 
 def print_summary(result: SimulationResult) -> None:
-  """Prints formatted summary tables for verification and QoS metrics."""
+  """Imprime en consola las tablas de verificación matemática y métricas de QoS.
+
+  Args:
+    result: Objeto SimulationResult con los resultados de la simulación.
+  """
   print("\n" + "=" * 68)
-  print("              SPORADIC SERVER SIMULATION SUMMARY")
+  print("        RESUMEN DE SIMULACIÓN DEL SERVIDOR ESPORÁDICO (SS)")
   print("=" * 68)
 
-  # Schedulability and RTA Report
+  # Análisis de Planificabilidad y Tiempos de Respuesta (RTA)
   if result.schedulability:
     s = result.schedulability
-    print("\n[+] Rate-Monotonic Schedulability & RTA Analysis:")
+    print("\n[+] Análisis de Planificabilidad Rate-Monotonic y RTA:")
     print(
-        f"    - Periodic Utilization (U_p) : {s.utilization_periodic:.4f} ({s.utilization_periodic * 100:.1f}%)"
+        f"    - Utilización Periódica (U_p) : {s.utilization_periodic:.4f} ({s.utilization_periodic * 100:.1f}%)"
     )
     print(
-        f"    - Server Utilization (U_s)   : {s.utilization_server:.4f} ({s.utilization_server * 100:.1f}%)"
+        f"    - Utilización del Servidor (U_s): {s.utilization_server:.4f} ({s.utilization_server * 100:.1f}%)"
     )
     print(
-        f"    - Total Utilization (U)      : {s.utilization_total:.4f} ({s.utilization_total * 100:.1f}%) <= 1.0"
+        f"    - Utilización Total (U_total) : {s.utilization_total:.4f} ({s.utilization_total * 100:.1f}%) <= 1.0"
     )
     print(
-        f"    - Liu & Layland Bound U_LL   : {s.liu_layland_bound:.4f} ({s.liu_layland_bound * 100:.1f}%)"
+        f"    - Cota de Liu & Layland U_LL  : {s.liu_layland_bound:.4f} ({s.liu_layland_bound * 100:.1f}%)"
     )
-    print("    - Exact Worst-Case Response Times (RTA):")
-    print("      Task   | Priority | C_i  | T_i  | D_i  | U_i    | R_i  | Schedulable?")
-    print("      " + "-" * 62)
+    print("    - Tiempos de Respuesta en Peor Caso (RTA):")
+    print("      Tarea   | Prioridad | C_i  | T_i  | D_i  | U_i    | R_i  | ¿Planificable?")
+    print("      " + "-" * 66)
     for tm in s.task_metrics:
-      status = "YES" if tm.schedulable else "NO"
+      status = "SÍ" if tm.schedulable else "NO"
       print(
-          f"      {tm.name:6s} | {tm.priority:8d} | {tm.c_i:4.1f} | {tm.t_i:4.1f} | {tm.d_i:4.1f} | {tm.u_i:6.3f} | {tm.response_time:4.1f} | {status}"
+          f"      {tm.name:7s} | {tm.priority:9d} | {tm.c_i:4.1f} | {tm.t_i:4.1f} | {tm.d_i:4.1f} | {tm.u_i:6.3f} | {tm.response_time:4.1f} | {status}"
       )
 
-  print("\n[+] Total CPU Execution Time by Runner:")
+  print("\n[+] Tiempo Total de CPU por Ejecutor:")
   for runner, duration in sorted(result.cpu_totals.items()):
-    print(f"    - {runner:12s}: {duration:5.1f} units")
-  print(f"    - Total Time  : {sum(result.cpu_totals.values()):5.1f} units")
+    print(f"    - {runner:12s}: {duration:5.1f} unidades")
+  print(f"    - Tiempo Total: {sum(result.cpu_totals.values()):5.1f} unidades")
 
-  print("\n[+] Activations (t_A) and Windows:")
-  print("    Idx | t_A   | Window End | Consumed | Reason Closed")
+  print("\n[+] Ventanas de Activación (t_A) del Servidor:")
+  print("    Núm | t_A   | Fin Ventana | Consumido | Causa de Cierre")
   print("    " + "-" * 55)
   for idx, act in enumerate(result.activations, 1):
     print(
-        f"    {idx:3d} | {act.activation_time:5.1f} | {act.closed_time:10.1f} |"
-        f" {act.amount_consumed:8.1f} | {act.reason}"
+        f"    {idx:3d} | {act.activation_time:5.1f} | {act.closed_time:11.1f} |"
+        f" {act.amount_consumed:9.1f} | {act.reason}"
     )
 
-  print("\n[+] Replenishments (t_R):")
-  print("    Idx | t_R   | Replenishment Amount")
+  print("\n[+] Recargas Programadas de Presupuesto (t_R):")
+  print("    Núm | t_R   | Monto de Recarga")
   print("    " + "-" * 35)
   for idx, rep in enumerate(result.replenishments, 1):
     print(f"    {idx:3d} | {rep.replenishment_time:5.1f} | +{rep.amount:.1f}")
 
-  print("\n[+] Aperiodic Job Completion Status & QoS Metrics:")
-  print("    Job | Arrival | Compute | Completion | Resp Time | Wait Time | Status")
-  print("    " + "-" * 66)
+  print("\n[+] Estado de Trabajos Aperiódicos y Métricas de QoS:")
+  print("    Trabajo | Llegada | Cómputo | Fin      | T. Resp | T. Espera | Estado")
+  print("    " + "-" * 68)
   for name, rec in sorted(result.job_records.items()):
     if rec.completion_time is not None:
       resp = rec.response_time if rec.response_time is not None else (rec.completion_time - rec.job.arrival_time)
       wait = rec.waiting_time if rec.waiting_time is not None else (resp - rec.job.compute_time)
       print(
-          f"    {name:3s} | {rec.job.arrival_time:7.1f} | {rec.job.compute_time:7.1f} | {rec.completion_time:10.1f} | {resp:9.1f} | {wait:9.1f} | Done"
+          f"    {name:7s} | {rec.job.arrival_time:7.1f} | {rec.job.compute_time:7.1f} | {rec.completion_time:8.1f} | {resp:7.1f} | {wait:9.1f} | Completado"
       )
     else:
       print(
-          f"    {name:3s} | {rec.job.arrival_time:7.1f} | {rec.job.compute_time:7.1f} | {'—':>10s} | {'—':>9s} | {'—':>9s} | Incomplete ({rec.remaining_time:.1f} left)"
+          f"    {name:7s} | {rec.job.arrival_time:7.1f} | {rec.job.compute_time:7.1f} | {'—':>8s} | {'—':>7s} | {'—':>9s} | Incompleto ({rec.remaining_time:.1f} u rest.)"
       )
 
   if result.schedulability and result.schedulability.avg_aperiodic_response_time:
     print(
-        f"\n    [*] Aperiodic Mean Response Time (W_avg): {result.schedulability.avg_aperiodic_response_time:.2f} units"
+        f"\n    [*] Tiempo Medio de Respuesta Aperiódico (W_avg): {result.schedulability.avg_aperiodic_response_time:.2f} unidades"
     )
     print(
-        f"    [*] Aperiodic Max Response Time  (W_max): {result.schedulability.max_aperiodic_response_time:.2f} units"
+        f"    [*] Tiempo Máximo de Respuesta Aperiódico (W_max): {result.schedulability.max_aperiodic_response_time:.2f} unidades"
     )
 
   if result.deadline_misses:
-    print(f"\n[!] WARNING: {len(result.deadline_misses)} deadline misses!")
+    print(f"\n[!] ADVERTENCIA: ¡{len(result.deadline_misses)} violaciones de plazos (deadlines perdidos)!")
   else:
-    print("\n[+] Periodic Deadlines: All deadlines met (0 misses).")
+    print("\n[+] Plazos Periódicos: Todos los plazos cumplidos satisfactoriamente (0 violaciones).")
   print("=" * 68 + "\n")
 
 
 # ==============================================================================
-# CLI Entrypoint
+# Cargador de Tareas desde Archivo JSON
+# ==============================================================================
+
+
+def load_tasks_from_json(
+    path: str,
+) -> tuple[list[PeriodicTask], SporadicServerConfig, list[AperiodicJob], float, float]:
+  """Carga la configuración de tareas y parámetros desde un archivo JSON.
+
+  Estructura esperada del JSON:
+    {
+      "horizon": 30.0,          (opcional, horizonte de simulación en unidades)
+      "dt": 0.1,                (opcional, paso delta t)
+      "periodic_tasks": [
+        {
+          "name": "$\\tau_1$",
+          "priority": 7,
+          "compute_time": 1.0,
+          "deadline": 6.0,
+          "period": 6.0,
+          "color": "#0072B2"    (opcional)
+        }, ...
+      ],
+      "server": {
+        "name": "$S_s$",        (opcional, default="$S_s$")
+        "priority": 4,
+        "budget": 2.0,
+        "period": 12.0,
+        "deadline": 12.0,
+        "color": "#16a085"      (opcional)
+      },
+      "aperiodic_jobs": [
+        {
+          "name": "J1",
+          "arrival_time": 2.0,
+          "compute_time": 1.0
+        }, ...
+      ]
+    }
+
+  Args:
+    path: Ruta del archivo JSON a cargar.
+
+  Returns:
+    Tupla con (periodic_tasks, server_config, aperiodic_jobs, horizon, dt).
+  """
+  with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+  horizon = float(data.get("horizon", SIMULATION_HORIZON))
+  dt = float(data.get("dt", DT))
+
+  # Cargar tareas periódicas con asignación automática de colores
+  periodic_tasks: list[PeriodicTask] = []
+  for idx, td in enumerate(data.get("periodic_tasks", [])):
+    color = td.get("color", _COLOR_PALETTE[idx % len(_COLOR_PALETTE)])
+    periodic_tasks.append(
+        PeriodicTask(
+            name=td["name"],
+            priority=int(td["priority"]),
+            compute_time=float(td["compute_time"]),
+            deadline=float(td["deadline"]),
+            period=float(td["period"]),
+            color=color,
+        )
+    )
+
+  # Cargar parámetros del Servidor Esporádico
+  sd = data.get("server", {})
+  server_color = sd.get("color", "#16a085")
+  server_config = SporadicServerConfig(
+      name=sd.get("name", r"$S_s$"),
+      priority=int(sd["priority"]),
+      budget=float(sd["budget"]),
+      period=float(sd["period"]),
+      deadline=float(sd.get("deadline", sd["period"])),
+      color=server_color,
+  )
+
+  # Cargar peticiones aperiódicas
+  aperiodic_jobs: list[AperiodicJob] = []
+  for jd in data.get("aperiodic_jobs", []):
+    aperiodic_jobs.append(
+        AperiodicJob(
+            name=jd["name"],
+            arrival_time=float(jd["arrival_time"]),
+            compute_time=float(jd["compute_time"]),
+        )
+    )
+
+  return periodic_tasks, server_config, aperiodic_jobs, horizon, dt
+
+
+# ==============================================================================
+# Punto de Entrada de Línea de Comandos (CLI)
 # ==============================================================================
 
 
 def main() -> None:
-  """CLI entrypoint."""
+  """Función principal para la ejecución por línea de comandos (CLI)."""
   parser = argparse.ArgumentParser(
-      description="Simulate and visualize the Sporadic Server (SS) algorithm."
+      description="Simulación y visualización interactiva del algoritmo Servidor Esporádico (SS)."
+  )
+  parser.add_argument(
+      "--version",
+      action="version",
+      version=f"sporadic_server_sim {VERSION}",
   )
   parser.add_argument(
       "--output",
       default="sporadic_server_simulation.png",
-      help="Path to save the generated simulation plot.",
+      help="Ruta para guardar la imagen generada de la simulación.",
   )
   parser.add_argument(
       "--html",
       default="sporadic_server_interactive.html",
-      help="Path to export the interactive HTML dashboard.",
+      help="Ruta para exportar el dashboard HTML interactivo.",
   )
   parser.add_argument(
       "--export-csv",
       default=None,
-      help="Optional path to export timeline execution slices to CSV.",
+      help="Ruta opcional para exportar las rebanadas de ejecución a CSV.",
   )
   parser.add_argument(
       "--export-json",
       default=None,
-      help="Optional path to export full simulation trace to JSON.",
+      help="Ruta opcional para exportar toda la traza a JSON.",
   )
   parser.add_argument(
       "--mode",
       choices=["queue_aware", "buttazzo_pure"],
       default="queue_aware",
-      help="Sporadic Server replenishment rule mode (default: queue_aware).",
+      help="Modo de regla de reposición del servidor (queue_aware o buttazzo_pure).",
   )
   parser.add_argument(
       "--dt",
       type=float,
       default=DT,
-      help="Discretization time step (default: 0.1).",
+      help="Paso de tiempo de discretización (por defecto: 0.1).",
   )
   parser.add_argument(
       "--horizon",
       type=float,
       default=SIMULATION_HORIZON,
-      help="Simulation horizon in time units (default: 30.0).",
+      help="Horizonte temporal de la simulación (por defecto: 30.0).",
   )
   parser.add_argument(
       "--no-show",
       action="store_true",
-      help="Disable interactive display of the Matplotlib GUI plot.",
+      help="Desactiva la apertura de la ventana gráfica interactiva de Matplotlib.",
+  )
+  parser.add_argument(
+      "--tasks-json",
+      default=None,
+      metavar="ARCHIVO",
+      help=(
+          "Ruta a un archivo JSON con la configuración de tareas. "
+          "Si no se especifica, se usa el conjunto por defecto (7 tareas). "
+          "Ver example_schedulable.json y example_unschedulable.json."
+      ),
   )
   args = parser.parse_args()
 
+  # Cargar tareas desde JSON o recurrir a los valores por defecto
+  periodic_tasks = None
+  server_config = None
+  aperiodic_jobs = None
+  horizon = args.horizon
+  dt = args.dt
+
+  if args.tasks_json:
+    print(f"[+] Cargando configuración de tareas desde: {args.tasks_json}")
+    periodic_tasks, server_config, aperiodic_jobs, json_horizon, json_dt = (
+        load_tasks_from_json(args.tasks_json)
+    )
+    if args.horizon == SIMULATION_HORIZON:
+      horizon = json_horizon
+    if args.dt == DT:
+      dt = json_dt
+    print(f"    → {len(periodic_tasks)} tarea(s) periódica(s) cargada(s)")
+    print(f"    → Horizonte: {horizon:.1f} | dt: {dt}")
+
   result = run_simulation(
-      horizon=args.horizon,
-      dt=args.dt,
+      horizon=horizon,
+      dt=dt,
+      periodic_tasks=periodic_tasks,
+      server_config=server_config,
+      aperiodic_jobs=aperiodic_jobs,
       mode=args.mode,
   )
+
+  # ── ADVERTENCIA DE PLANIFICABILIDAD ──────────────────────────────────────────
+  # Si la utilización total supera 1.0 o alguna tarea no pasa el RTA,
+  # se imprime una advertencia en rojo para que el usuario pueda identificar
+  # el caso de conjunto de tareas NO PLANIFICABLE.
+  if result.schedulability:
+    s = result.schedulability
+    if s.utilization_total > 1.0:
+      print(
+          "\033[91m[!] ADVERTENCIA: U_total = "
+          f"{s.utilization_total:.4f} > 1.0 — El sistema DEFINITIVAMENTE"
+          " no es planificable (sobrecarga de CPU).\033[0m"
+      )
+    elif not s.all_schedulable:
+      print(
+          "\033[91m[!] ADVERTENCIA: Algunas tareas NO pasan el RTA "
+          "(R_i > D_i). El sistema tiene riesgo de incumplimiento de plazos.\033[0m"
+      )
+    else:
+      print(
+          f"\033[92m[✓] Sistema planificable bajo RM: U_total = "
+          f"{s.utilization_total:.4f} ≤ 1.0 y todos los R_i ≤ D_i.\033[0m"
+      )
   print_summary(result)
 
   plot_simulation(
       result,
       output_path=args.output,
       show=not args.no_show,
-      horizon=args.horizon,
+      horizon=horizon,
+      periodic_tasks=periodic_tasks,
+      server_config=server_config,
       interactive_html=args.html,
   )
 

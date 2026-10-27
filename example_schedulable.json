@@ -1,0 +1,29 @@
+{
+  "_comment": "Escenario PLANIFICABLE: 6 tareas periódicas + Servidor Esporádico. U_total ≈ 0.783 < 1.0. Todas las tareas pasan el RTA (R_i ≤ D_i).",
+  "horizon": 30.0,
+  "dt": 0.1,
+  "periodic_tasks": [
+    {"name": "$\\tau_1$", "priority": 7, "compute_time": 1.0, "deadline": 6.0,  "period": 6.0,  "color": "#0072B2"},
+    {"name": "$\\tau_2$", "priority": 6, "compute_time": 1.0, "deadline": 10.0, "period": 10.0, "color": "#009E73"},
+    {"name": "$\\tau_3$", "priority": 5, "compute_time": 1.0, "deadline": 12.0, "period": 12.0, "color": "#D55E00"},
+    {"name": "$\\tau_4$", "priority": 3, "compute_time": 1.5, "deadline": 15.0, "period": 15.0, "color": "#CC79A7"},
+    {"name": "$\\tau_5$", "priority": 2, "compute_time": 2.0, "deadline": 20.0, "period": 20.0, "color": "#E69F00"},
+    {"name": "$\\tau_6$", "priority": 1, "compute_time": 2.0, "deadline": 30.0, "period": 30.0, "color": "#56B4E9"}
+  ],
+  "server": {
+    "name": "$S_s$",
+    "priority": 4,
+    "budget": 2.0,
+    "period": 12.0,
+    "deadline": 12.0,
+    "color": "#16a085"
+  },
+  "aperiodic_jobs": [
+    {"name": "J1", "arrival_time": 2.0,  "compute_time": 1.0},
+    {"name": "J2", "arrival_time": 5.0,  "compute_time": 1.0},
+    {"name": "J3", "arrival_time": 9.0,  "compute_time": 2.0},
+    {"name": "J4", "arrival_time": 13.0, "compute_time": 1.0},
+    {"name": "J5", "arrival_time": 17.0, "compute_time": 1.5},
+    {"name": "J6", "arrival_time": 22.0, "compute_time": 1.0}
+  ]
+}
